@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+import sys
+import xml.etree.ElementTree as ET
+import subprocess
+location = sys.argv[2]
+if location not in ("started", "stopped"):
+        exit(0)
+started = (location == "started")
+
+xml = sys.stdin.read()
+root = ET.fromstring(xml)
+
+allifs = [dev for dev in (x.attrib["dev"] for x in root.findall("devices/interface/target")) if dev.startswith("vm_")]
+if_default = None
+if len(allifs) == 1:
+    if_default = allifs[0]
+
+if root.find("metadata") is not None and root.find("metadata").find("{http://selfnet.de}net") is not None :
+    for ipe in root.find("metadata").find("{http://selfnet.de}net").findall("ip") :
+        ip = ipe.text.strip()
+        iface = ipe.attrib.get("interface", if_default)
+        if iface is None :
+            raise ValueError("need to specify interface")
+        iface = iface.strip()
+
+        if started :
+                cmd = ["ip", "route", "add", ip, "dev", iface]
+                subprocess.run(cmd, check=True)
+
+                if ":" in ip: #v6
+                        cmd = ["ip", "-6", "neigh", "add", "proxy", "2001:7c0:e701::1", "dev", iface] #route zum vm-gateway
+                        subprocess.run(cmd, check=True)
+                        cmd = ["ip", "-6", "neigh", "add", "proxy", "2001:7c7:2100::1", "dev", iface] #route zum neuen vm-gateway
+                        subprocess.run(cmd, check=True)
+                        cmd = ["ip", "-6", "neigh", "add", "proxy", "2a0e:3c0::1", "dev", iface] #route zum noch neueren vm-gateway
+                        subprocess.run(cmd, check=True)
+
+                        cmd = ["sysctl", "net.ipv6.conf.%s.proxy_ndp=1"%iface]
+                        subprocess.run(cmd, check=True)
+        else :
+                if ":" in ip: #v6
+                        pass
+

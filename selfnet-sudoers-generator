@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import ctypes
+import pwd
+import sys
+import json
+
+libsudo = ctypes.CDLL("libsss_sudo.so")
+
+sss_sudo_send_recv = libsudo.sss_sudo_send_recv
+sss_sudo_free_result = libsudo.sss_sudo_free_result
+class SSSSudoAttr(ctypes.Structure):
+    _fields_ = ("name", ctypes.c_char_p), ("values", ctypes.POINTER(ctypes.c_char_p)), ("num_values", ctypes.c_uint)
+
+class SSSSudoRule(ctypes.Structure):
+    _fields_ = ("num_attrs", ctypes.c_uint), ("attrs",  ctypes.POINTER(SSSSudoAttr))
+
+class SSSSudoResult(ctypes.Structure):
+    _fields_ = ("num_rules", ctypes.c_uint), ("rules", ctypes.POINTER(SSSSudoRule))
+
+sss_sudo_send_recv.argtypes = [ctypes.c_uint, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.POINTER(SSSSudoResult))]
+sss_sudo_send_recv.restype = ctypes.c_int
+
+sss_sudo_free_result.argtypes = [ctypes.POINTER(SSSSudoResult)]
+sss_sudo_free_result.restype = None
+
+def send_recv(uid, username) :
+    username_c = ctypes.c_char_p(username.encode())
+    error = ctypes.c_uint32()
+    domainname = ctypes.c_char_p()
+    result = ctypes.POINTER(SSSSudoResult)()
+    sss_sudo_send_recv(uid, username_c, domainname, ctypes.byref(error), ctypes.byref(result))
+    rules = []
+    if not result:
+        return rules
+    for i_rule in range(result.contents.num_rules):
+        rule_c = result.contents.rules[i_rule]
+        rule = {}
+        for i_attr in range(rule_c.num_attrs) :
+            attr_c = rule_c.attrs[i_attr]
+            values = []
+            for i_value in range(attr_c.num_values) :
+                values.append(attr_c.values[i_value].decode())
+            rule[attr_c.name.decode()] = values
+        rules.append(rule)
+    sss_sudo_free_result(result)
+    return rules
+
+def user_can_sudo(uid, name) :
+    r = send_recv(uid, name)
+    return bool(len(r) and 'sudoCommand' in r[0] and len(r[0]['sudoCommand']) and r[0]['sudoCommand'][0] == "ALL")
+
+if __name__ == "__main__":
+    sudo_users = [user.pw_name for user in pwd.getpwall() if user_can_sudo(user.pw_uid, user.pw_name)]
+    with open(sys.argv[1], "w") as fi:
+        json.dump(sudo_users, fi)

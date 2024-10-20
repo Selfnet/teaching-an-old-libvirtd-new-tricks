@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+import ldap
+import libvirt
+import xml.etree.ElementTree as ET
+import json
+import sys
+from string import Template
+
+script=Template("""
+var kvmAdminUsers = $kvm_admin_users;
+function KvmDomainUser(user, domain) {
+    this.user = user;
+    this.domain = domain;
+};
+var kvmDomainUsers = [
+$kvm_domain_users
+];
+
+var kvmSecretsAllowed = $kvm_secrets_allowed;
+
+function kvmIsAdmin(user) {
+    return kvmAdminUsers.indexOf(user) != -1;
+}
+
+function kvmCanManage(user) {
+    if(kvmIsAdmin(user))
+        return true;
+    for(i = 0; i < kvmDomainUsers.length; i++) {
+        if(kvmDomainUsers[i].user == user)
+            return true;
+    }
+    return false;
+}
+
+function kvmCanManagerDomain(user, domain) {
+    for(i = 0; i < kvmDomainUsers.length; i++) {
+        if(kvmDomainUsers[i].user == user && kvmDomainUsers[i].domain == domain)
+            return true;
+    }
+    return false;
+
+}
+
+var kvmActionsAllowed = [
+    "org.libvirt.api.connect.getattr",
+    "org.libvirt.api.connect.search-domains",
+];
+
+var kvmSecretActionsAllowed = [
+    "org.libvirt.api.secret.getattr",
+    "org.libvirt.api.secret.read-secure"
+];
+
+var kvmDomainActionsAllowed = [
+    "org.libvirt.api.domain.getattr",
+    "org.libvirt.api.domain.read",
+    "org.libvirt.api.domain.init-control",
+    "org.libvirt.api.domain.open-device",
+    "org.libvirt.api.domain.reset",
+    "org.libvirt.api.domain.start",
+];
+
+
+polkit.addRule(function(action, subject) {
+     if (action.id == "org.libvirt.unix.manage") {
+         if (kvmCanManage(subject.user))
+             return polkit.Result.YES;
+         else
+             return polkit.Result.NO;
+     }
+     if(action.id.indexOf("org.libvirt.api.") == 0) {
+         if(kvmIsAdmin(subject.user)) 
+              return polkit.Result.YES;
+
+         if(kvmActionsAllowed.indexOf(action.id) != -1)
+             return polkit.Result.YES;
+
+         if(kvmDomainActionsAllowed.indexOf(action.id) != -1) {
+             if(kvmCanManagerDomain(subject.user, action.lookup("domain_uuid"))) {
+                 return polkit.Result.YES;
+            }
+         }
+         if(kvmSecretActionsAllowed.indexOf(action.id) != -1) {
+             if(kvmSecretsAllowed.indexOf(action.lookup("secret_uuid")) != -1) {
+                 return polkit.Result.YES;
+            }
+         }
+
+         return polkit.Result.NO;
+     }
+ 
+
+});
+""")
+
+ldap_conn = ldap.initialize("ldaps://aaa.selfnet.de")
+ldap_conn.simple_bind("", "")
+ldap_results =ldap_conn.search_s("ou=sudoers,dc=selfnet,dc=de", ldap.SCOPE_SUBTREE, "objectclass=sudoRole")
+sudos = {}
+for k,v in ldap_results:
+    users = {x.decode() for x in v["sudoUser"]}
+    for host in v["sudoHost"] :
+        host = host.decode()
+        sudos[host] = users
+
+vm_admins = set()
+
+libvirt_conn = libvirt.open("qemu:///system")
+for domain in libvirt_conn.listAllDomains() :
+    xml = domain.XMLDesc()
+    root = ET.fromstring(xml)
+    uuid = root.find("uuid").text
+    name = root.find("name").text
+    if root.find("metadata") is not None and root.find("metadata").find("{http://selfnet.de}net") is not None :
+        for ipe in root.find("metadata").find("{http://selfnet.de}net").findall("ip") :
+            ip = ipe.text.strip()
+            if ip in sudos :
+                users = sudos[ip]
+                for user in users:
+                    vm_admins.add((uuid, name, user))
+
+private_secrets = []
+
+for secret in libvirt_conn.listAllSecrets() :
+    xml = secret.XMLDesc()
+    root = ET.fromstring(xml)
+    if root.attrib.get("private", "no") == "yes" :
+        private_secrets.append(root.find("uuid").text)
+
+with open("/var/cache/selfnet-sudoers.json", "r") as fi:
+    sudoers = json.load(fi)
+
+kvm_domain_users = "\n".join(f'    new KvmDomainUser("{user}", "{uuid}"), //{name}' for uuid, name, user in vm_admins)
+
+with open(sys.argv[1], "w") as fi:
+    fi.write(script.substitute(kvm_admin_users = json.dumps(sudoers), kvm_domain_users=kvm_domain_users, kvm_secrets_allowed = json.dumps(private_secrets)))
